@@ -38,10 +38,10 @@ jobs:
             local has_author_claude=""
             local has_review_codex=""
             local has_review_claude=""
+            local changes_workflow=""
             local checks_json=""
             local checks_status=0
             local blocked_checks=""
-            local normalized_required_checks=""
             local required_check=""
             local -a required_check_names=()
 
@@ -50,7 +50,7 @@ jobs:
             if ! pr_metadata="$(
               gh pr view "$pr_number" \
                 --repo "$GH_REPO" \
-                --json headRefOid,isDraft,labels \
+                --json files,headRefOid,isDraft,labels \
                 --jq '
                   [.labels[].name] as $labels
                   | [
@@ -59,7 +59,8 @@ jobs:
                       (($labels | index("author:codex")) != null),
                       (($labels | index("author:claude")) != null),
                       (($labels | index("review:codex")) != null),
-                      (($labels | index("review:claude")) != null)
+                      (($labels | index("review:claude")) != null),
+                      any(.files[]?; .path | startswith(".github/workflows/"))
                     ]
                   | @tsv
                 '
@@ -74,10 +75,16 @@ jobs:
               has_author_codex \
               has_author_claude \
               has_review_codex \
-              has_review_claude <<< "$pr_metadata"
+              has_review_claude \
+              changes_workflow <<< "$pr_metadata"
 
             if [[ "$is_draft" == "true" ]]; then
               echo "PR #$pr_number: pull request is a draft; skipping merge."
+              return 0
+            fi
+
+            if [[ "$changes_workflow" == "true" ]]; then
+              echo "PR #$pr_number: changes a file under .github/workflows/; human merge required."
               return 0
             fi
 
@@ -97,7 +104,7 @@ jobs:
             checks_json="$(
               gh pr checks "$pr_number" \
                 --repo "$GH_REPO" \
-                --json name,state,workflow
+                --json name,state
             )" || checks_status=$?
 
             if [[ -z "$checks_json" ]]; then
@@ -105,23 +112,13 @@ jobs:
               return 0
             fi
 
-            if ! checks_json="$(
-              jq \
-                --arg current_workflow "$GITHUB_WORKFLOW" \
-                '[.[] | select(.workflow != $current_workflow)]' \
-                <<< "$checks_json"
-            )"; then
-              echo "PR #$pr_number: check data was not valid JSON; skipping merge."
-              return 0
-            fi
-
             if [[ "$(jq 'length' <<< "$checks_json")" -eq 0 ]]; then
-              echo "PR #$pr_number: has no checks from another workflow; skipping merge."
+              echo "PR #$pr_number: has no checks; skipping merge."
               return 0
             fi
 
             if ! jq -e 'any(.[]; .state == "SUCCESS")' <<< "$checks_json" >/dev/null; then
-              echo "PR #$pr_number: no check from another workflow has an actual SUCCESS state; skipping merge."
+              echo "PR #$pr_number: no check has an actual SUCCESS state; skipping merge."
               return 0
             fi
 
@@ -142,8 +139,13 @@ jobs:
               return 0
             fi
 
-            normalized_required_checks="${REQUIRED_CHECKS//,/ }"
-            read -r -a required_check_names <<< "$normalized_required_checks"
+            while IFS= read -r required_check; do
+              required_check="${required_check#"${required_check%%[![:space:]]*}"}"
+              required_check="${required_check%"${required_check##*[![:space:]]}"}"
+              if [[ -n "$required_check" ]]; then
+                required_check_names+=("$required_check")
+              fi
+            done < <(tr ',' '\n' <<< "${REQUIRED_CHECKS:-}")
 
             for required_check in "${required_check_names[@]}"; do
               if ! jq -e \
@@ -163,7 +165,7 @@ jobs:
               --match-head-commit "$head_commit"; then
               echo "PR #$pr_number: squash merge completed."
             else
-              echo "PR #$pr_number: merge failed; a later scheduled or manual sweep will retry."
+              echo "PR #$pr_number: merge command returned an error; verify the pull request state manually."
             fi
           }
 
