@@ -38,7 +38,7 @@ jobs:
             local has_author_claude=""
             local has_review_codex=""
             local has_review_claude=""
-            local changes_workflow=""
+            local changed_paths=""
             local checks_json=""
             local checks_status=0
             local blocked_checks=""
@@ -50,7 +50,7 @@ jobs:
             if ! pr_metadata="$(
               gh pr view "$pr_number" \
                 --repo "$GH_REPO" \
-                --json files,headRefOid,isDraft,labels \
+                --json headRefOid,isDraft,labels \
                 --jq '
                   [.labels[].name] as $labels
                   | [
@@ -59,8 +59,7 @@ jobs:
                       (($labels | index("author:codex")) != null),
                       (($labels | index("author:claude")) != null),
                       (($labels | index("review:codex")) != null),
-                      (($labels | index("review:claude")) != null),
-                      any(.files[]?; .path | startswith(".github/workflows/"))
+                      (($labels | index("review:claude")) != null)
                     ]
                   | @tsv
                 '
@@ -75,15 +74,19 @@ jobs:
               has_author_codex \
               has_author_claude \
               has_review_codex \
-              has_review_claude \
-              changes_workflow <<< "$pr_metadata"
+              has_review_claude <<< "$pr_metadata"
 
             if [[ "$is_draft" == "true" ]]; then
               echo "PR #$pr_number: pull request is a draft; skipping merge."
               return 0
             fi
 
-            if [[ "$changes_workflow" == "true" ]]; then
+            if ! changed_paths="$(gh api --paginate "repos/$GH_REPO/pulls/$pr_number/files" --jq '.[].filename')"; then
+              echo "PR #$pr_number: unable to list changed files; skipping merge."
+              return 0
+            fi
+
+            if grep -q '^\.github/workflows/' <<< "$changed_paths"; then
               echo "PR #$pr_number: changes a file under .github/workflows/; human merge required."
               return 0
             fi
