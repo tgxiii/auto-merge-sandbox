@@ -17,139 +17,154 @@ concurrency:
 jobs:
   merge:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REQUIRED_CHECKS: ''
     steps:
       - name: Merge eligible pull requests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          REQUIRED_CHECKS: ''
         shell: bash
         run: |
           set -euo pipefail
 
           evaluate_and_merge() {
             local pr_number="$1"
-            local pr_json head_sha is_draft label_verdict checks_evaluation
-            local checks_status=0 merge_output merge_status=0
+            local pr_metadata=""
+            local is_draft=""
+            local head_commit=""
+            local has_author_codex=""
+            local has_author_claude=""
+            local has_review_codex=""
+            local has_review_claude=""
+            local checks_json=""
+            local checks_status=0
+            local blocked_checks=""
+            local normalized_required_checks=""
+            local required_check=""
+            local -a required_check_names=()
 
-            if ! pr_json="$(
+            # jq variables must remain literal inside the single-quoted filter.
+            # shellcheck disable=SC2016
+            if ! pr_metadata="$(
               gh pr view "$pr_number" \
                 --repo "$GH_REPO" \
-                --json labels,headRefOid,isDraft
-              )"; then
-              echo "PR #$pr_number: unable to fetch PR details; skipping."
+                --json headRefOid,isDraft,labels \
+                --jq '
+                  [.labels[].name] as $labels
+                  | [
+                      .isDraft,
+                      .headRefOid,
+                      (($labels | index("author:codex")) != null),
+                      (($labels | index("author:claude")) != null),
+                      (($labels | index("review:codex")) != null),
+                      (($labels | index("review:claude")) != null)
+                    ]
+                  | @tsv
+                '
+            )"; then
+              echo "PR #$pr_number: unable to fetch pull request metadata; skipping merge."
               return 0
             fi
 
-            is_draft="$(jq -r '.isDraft' <<< "$pr_json")"
+            IFS=$'\t' read -r \
+              is_draft \
+              head_commit \
+              has_author_codex \
+              has_author_claude \
+              has_review_codex \
+              has_review_claude <<< "$pr_metadata"
+
             if [[ "$is_draft" == "true" ]]; then
-              echo "PR #$pr_number: is a draft; skipping."
+              echo "PR #$pr_number: pull request is a draft; skipping merge."
               return 0
             fi
 
-            head_sha="$(jq -r '.headRefOid' <<< "$pr_json")"
-
-            label_verdict="$(
-              jq -r '
-                [.labels[].name] as $labels
-                | (($labels | index("author:codex")) != null) as $ac
-                | (($labels | index("author:claude")) != null) as $al
-                | (($labels | index("review:codex")) != null) as $rc
-                | (($labels | index("review:claude")) != null) as $rl
-                | if $ac and $al then "both-authors"
-                  elif ($ac and $rl) or ($al and $rc) then "ok"
-                  else "missing-pair"
-                  end
-              ' <<< "$pr_json"
-            )"
-
-            if [[ "$label_verdict" == "both-authors" ]]; then
-              echo "PR #$pr_number: carries both author:codex and author:claude labels; refusing to merge."
-              return 0
-            fi
-            if [[ "$label_verdict" != "ok" ]]; then
-              echo "PR #$pr_number: lacks a required label pair (author:codex with review:claude, or author:claude with review:codex); skipping."
+            if [[ "$has_author_codex" == "true" && "$has_author_claude" == "true" ]]; then
+              echo "PR #$pr_number: both author labels are present; refusing to merge."
               return 0
             fi
 
-            checks_evaluation="$(
+            if ! {
+              [[ "$has_author_codex" == "true" && "$has_review_claude" == "true" ]] ||
+                [[ "$has_author_claude" == "true" && "$has_review_codex" == "true" ]]
+            }; then
+              echo "PR #$pr_number: lacks a cross-vendor author and review label pair; skipping merge."
+              return 0
+            fi
+
+            checks_json="$(
               gh pr checks "$pr_number" \
                 --repo "$GH_REPO" \
-                --json name,state,workflow \
-                --jq '
-                  [.[] | select(.workflow != "Auto squash-merge")] as $checks
-                  | if ($checks | length) == 0 then
-                      "none"
-                    elif ([$checks[] | select(.state == "SUCCESS")] | length) == 0 then
-                      "no-success"
-                    elif all($checks[]; .state == "SUCCESS" or .state == "SKIPPED") then
-                      "ready"
-                    else
-                      "blocked: "
-                      + (
-                          [
-                            $checks[]
-                            | select(.state != "SUCCESS" and .state != "SKIPPED")
-                            | "\(.name)=\(.state)"
-                          ]
-                          | join(", ")
-                        )
-                    end
-                '
+                --json name,state,workflow
             )" || checks_status=$?
 
-            if [[ -z "$checks_evaluation" ]]; then
-              echo "PR #$pr_number: unable to evaluate checks (gh exited with status $checks_status); skipping."
+            if [[ -z "$checks_json" ]]; then
+              echo "PR #$pr_number: unable to evaluate checks (gh exited with status $checks_status); skipping merge."
               return 0
             fi
 
-            if [[ "$checks_evaluation" == "none" ]]; then
-              echo "PR #$pr_number: has no checks from other workflows; skipping."
+            if ! checks_json="$(
+              jq \
+                --arg current_workflow "$GITHUB_WORKFLOW" \
+                '[.[] | select(.workflow != $current_workflow)]' \
+                <<< "$checks_json"
+            )"; then
+              echo "PR #$pr_number: check data was not valid JSON; skipping merge."
               return 0
             fi
 
-            if [[ "$checks_evaluation" == "no-success" ]]; then
-              echo "PR #$pr_number: no check concluded SUCCESS (all skipped or none ran); refusing to merge."
+            if [[ "$(jq 'length' <<< "$checks_json")" -eq 0 ]]; then
+              echo "PR #$pr_number: has no checks from another workflow; skipping merge."
               return 0
             fi
 
-            if [[ "$checks_evaluation" != "ready" ]]; then
-              echo "PR #$pr_number: checks not all SUCCESS or SKIPPED ($checks_evaluation); skipping."
+            if ! jq -e 'any(.[]; .state == "SUCCESS")' <<< "$checks_json" >/dev/null; then
+              echo "PR #$pr_number: no check from another workflow has an actual SUCCESS state; skipping merge."
               return 0
             fi
 
-            if [[ -n "$REQUIRED_CHECKS" ]]; then
-              local missing
-              missing="$(
-                gh pr checks "$pr_number" \
-                  --repo "$GH_REPO" \
-                  --json name,state \
-                  --jq --arg req "$REQUIRED_CHECKS" '
-                    [.[] | select(.state == "SUCCESS") | .name] as $ok
-                    | [$req | split("[ ,]+"; "") | .[] | select(length > 0) | select(. as $n | ($ok | index($n)) == null)]
-                    | join(", ")
-                  '
-              )" || true
-              if [[ -n "$missing" ]]; then
-                echo "PR #$pr_number: required checks not green or missing: $missing; skipping."
+            if jq -e \
+              'any(.[]; .state != "SUCCESS" and .state != "SKIPPED")' \
+              <<< "$checks_json" >/dev/null; then
+              blocked_checks="$(
+                jq -r '
+                  [
+                    .[]
+                    | select(.state != "SUCCESS" and .state != "SKIPPED")
+                    | "\(.name)=\(.state)"
+                  ]
+                  | join(", ")
+                ' <<< "$checks_json"
+              )"
+              echo "PR #$pr_number: checks are not all SUCCESS or SKIPPED ($blocked_checks); skipping merge."
+              return 0
+            fi
+
+            normalized_required_checks="${REQUIRED_CHECKS//,/ }"
+            read -r -a required_check_names <<< "$normalized_required_checks"
+
+            for required_check in "${required_check_names[@]}"; do
+              if ! jq -e \
+                --arg required_check "$required_check" \
+                'any(.[]; .name == $required_check and .state == "SUCCESS")' \
+                <<< "$checks_json" >/dev/null; then
+                echo "PR #$pr_number: required check '$required_check' is missing or not SUCCESS; skipping merge."
                 return 0
               fi
-            fi
+            done
 
-            echo "PR #$pr_number: label pair present and checks green; attempting squash merge of $head_sha."
-            merge_output="$(
-              gh pr merge "$pr_number" \
-                --repo "$GH_REPO" \
-                --squash \
-                --delete-branch \
-                --match-head-commit "$head_sha" 2>&1
-            )" || merge_status=$?
-            if [[ "$merge_status" -ne 0 ]]; then
-              echo "PR #$pr_number: merge failed (exit $merge_status): $merge_output"
+            echo "PR #$pr_number: eligibility gates passed; attempting squash merge of $head_commit."
+            if gh pr merge "$pr_number" \
+              --repo "$GH_REPO" \
+              --squash \
+              --delete-branch \
+              --match-head-commit "$head_commit"; then
+              echo "PR #$pr_number: squash merge completed."
             else
-              echo "PR #$pr_number: merged."
+              echo "PR #$pr_number: merge failed; a later scheduled or manual sweep will retry."
             fi
-            return 0
           }
 
           pr_numbers="$(
@@ -158,7 +173,7 @@ jobs:
               --state open \
               --limit 100 \
               --json number \
-              --jq ".[].number"
+              --jq '.[].number'
           )"
 
           if [[ -z "$pr_numbers" ]]; then
