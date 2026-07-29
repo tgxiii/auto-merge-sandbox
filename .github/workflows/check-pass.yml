@@ -1,0 +1,11 @@
+name: Check pass
+
+on:
+  pull_request:
+
+jobs:
+  auto-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Always pass
+        run: echo "ok"
